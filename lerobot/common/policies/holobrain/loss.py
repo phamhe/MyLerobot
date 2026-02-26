@@ -1,8 +1,7 @@
 """HoloBrain action loss — Phase 1 simplified version.
 
 Phase 1 simplifications:
-  - SmoothL1 for pos and rot (no Wasserstein distance)
-  - BCE for gripper
+  - SmoothL1 for all action dimensions (pos, rot, gripper)
   - timestep weighting: 1000 / (t + 1)
   - No FK loss, parallel_weight, or mobile loss
 """
@@ -16,7 +15,7 @@ class HoloBrainActionLoss(nn.Module):
     """Compute diffusion training loss for HoloBrain Phase 1.
 
     Action is 7-dim: pos(3) + rot(3) + gripper(1).
-    Loss = SmoothL1(pos) + SmoothL1(rot) + BCE(gripper), weighted by timestep.
+    Loss = SmoothL1(pos) + SmoothL1(rot) + SmoothL1(gripper), weighted by timestep.
     """
 
     def __init__(
@@ -58,7 +57,7 @@ class HoloBrainActionLoss(nn.Module):
 
         loss_pos = F.smooth_l1_loss(pred_pos, tgt_pos, beta=self.smooth_l1_beta, reduction="none")
         loss_rot = F.smooth_l1_loss(pred_rot, tgt_rot, beta=self.smooth_l1_beta, reduction="none")
-        loss_grip = F.binary_cross_entropy_with_logits(pred_grip, tgt_grip, reduction="none")
+        loss_grip = F.smooth_l1_loss(pred_grip, tgt_grip, beta=self.smooth_l1_beta, reduction="none")
 
         # Sum over feature dims, keep batch and time
         loss = (

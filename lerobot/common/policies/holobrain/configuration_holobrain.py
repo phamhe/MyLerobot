@@ -55,7 +55,7 @@ class HoloBrainConfig(PreTrainedConfig):
 
     # --- Loss ---
     smooth_l1_beta: float = 0.04
-    timestep_loss_weight: float = 1000.0
+    timestep_loss_weight: float = 0.0
     pos_weight: float = 1.0
     rot_weight: float = 1.0
     grip_weight: float = 1.0
@@ -114,7 +114,7 @@ class HoloBrainConfig(PreTrainedConfig):
             return {}
         return {
             k: v for k, v in self.input_features.items()
-            if hasattr(v, "type") and str(v.type).upper() == "VISUAL"
+            if hasattr(v, "type") and _feature_type_name(v.type) == "VISUAL"
         }
 
     @property
@@ -122,7 +122,7 @@ class HoloBrainConfig(PreTrainedConfig):
         if not self.input_features:
             return None
         for k, v in self.input_features.items():
-            if hasattr(v, "type") and str(v.type).upper() == "STATE":
+            if hasattr(v, "type") and _feature_type_name(v.type) == "STATE":
                 return v
         return None
 
@@ -131,6 +131,15 @@ class HoloBrainConfig(PreTrainedConfig):
         if not self.output_features:
             return None
         for k, v in self.output_features.items():
-            if hasattr(v, "type") and str(v.type).upper() == "ACTION":
+            if hasattr(v, "type") and _feature_type_name(v.type) == "ACTION":
                 return v
         return None
+
+
+def _feature_type_name(ft) -> str:
+    """Extract feature type name from FeatureType enum or string."""
+    if hasattr(ft, "value"):
+        return str(ft.value).upper()
+    if hasattr(ft, "name"):
+        return str(ft.name).upper()
+    return str(ft).upper()

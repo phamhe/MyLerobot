@@ -195,9 +195,9 @@ def main():
     }
 
     normalization_mapping = {
-        "VISUAL": NormalizationMode.MEAN_STD,
-        "STATE": NormalizationMode.MIN_MAX,
-        "ACTION": NormalizationMode.MIN_MAX,
+        FeatureType.VISUAL: NormalizationMode.MEAN_STD,
+        FeatureType.STATE: NormalizationMode.MIN_MAX,
+        FeatureType.ACTION: NormalizationMode.MIN_MAX,
     }
 
     config = HoloBrainConfig(

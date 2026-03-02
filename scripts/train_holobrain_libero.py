@@ -64,6 +64,10 @@ def parse_args():
                         help="Loss type: mse or smooth_l1")
     parser.add_argument("--state_noise_std", type=float, default=0.0,
                         help="Gaussian noise std for state augmentation")
+    parser.add_argument("--use_urdf", action="store_true",
+                        help="Enable URDF-based joint graph attention (Phase 4)")
+    parser.add_argument("--num_joints", type=int, default=7,
+                        help="Number of joints for URDF mode")
     # Logging
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="holobrain-libero")
@@ -362,6 +366,8 @@ def main():
         lr=args.lr,
         device=device,
         loss_type=args.loss_type,
+        use_urdf=args.use_urdf,
+        num_joints=args.num_joints,
     )
     config.validate_features()
 

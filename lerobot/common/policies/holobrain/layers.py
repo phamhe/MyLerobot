@@ -370,6 +370,146 @@ class TemporalSelfAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# TemporalJointGraphAttention — joint + temporal attention (Phase 4)
+# ---------------------------------------------------------------------------
+
+class TemporalJointGraphAttention(nn.Module):
+    """Joint-temporal attention with RoPE (temporal) + ScalarEmbedder (joint).
+
+    Ported from RoboOrchardLab. Fuses temporal position encoding (RoPE) with
+    URDF-derived joint distance encoding (ScalarEmbedder) into a single
+    attention operation over (joint, time) dimensions.
+
+    Input shape: (B, num_joint, T, C) — operates jointly across joints and time.
+    """
+
+    def __init__(
+        self,
+        embed_dims: int,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        max_position_embeddings: int = 128,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = embed_dims // num_heads
+        self.scale = head_dim ** -0.5
+        self.embed_dims = embed_dims
+
+        self.q_proj = nn.Linear(embed_dims, embed_dims, bias=qkv_bias)
+        self.k_proj = nn.Linear(embed_dims, embed_dims, bias=False)
+        self.v_proj = nn.Linear(embed_dims, embed_dims, bias=qkv_bias)
+        self.proj = nn.Linear(embed_dims, embed_dims)
+
+        self.joint_pos_encoder = ScalarEmbedder(embed_dims)
+        self.temporal_position_encoder = RotaryEmbedding(
+            head_dim, max_position_embeddings=max_position_embeddings
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        xavier_uniform_(self.q_proj.weight)
+        xavier_uniform_(self.k_proj.weight)
+        xavier_uniform_(self.v_proj.weight)
+        if self.q_proj.bias is not None:
+            constant_(self.q_proj.bias, 0.0)
+        if self.v_proj.bias is not None:
+            constant_(self.v_proj.bias, 0.0)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        joint_distance: torch.Tensor | None = None,
+        temporal_pos_q: torch.Tensor | None = None,
+        temporal_pos_k: torch.Tensor | None = None,
+        temporal_attn_mask: torch.Tensor | None = None,
+        identity: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: (B, N, T_q, C) — N=num_joint, T_q=num_query_chunks
+            key: (B, M, T_k, C) — M=num_joint, T_k=num_key_chunks (incl. history)
+            joint_distance: (B, N, M) pairwise joint distances
+            temporal_pos_q: (B, T_q) position ids for query
+            temporal_pos_k: (B, T_k) position ids for key
+            temporal_attn_mask: (T_q, T_k) or (B, T_q, T_k) bool mask, True=masked
+        Returns:
+            (B, N, T_q, C)
+        """
+        if identity is None:
+            identity = query
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        B, N, T_q, C = query.shape
+        M, T_k = key.shape[1:3]
+
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        # (B, h, N, T_q, c)
+        q = q.reshape(B, N, T_q, self.num_heads, -1).permute(0, 3, 1, 2, 4)
+        k = k.reshape(B, M, T_k, self.num_heads, -1).permute(0, 3, 1, 2, 4)
+        # (B, h, M*T_k, c) for final matmul with attn
+        v = v.reshape(B, M * T_k, self.num_heads, -1).permute(0, 2, 1, 3)
+
+        # Apply temporal RoPE
+        if temporal_pos_q is not None:
+            q = self.temporal_position_encoder(q, temporal_pos_q)
+        if temporal_pos_k is not None:
+            k = self.temporal_position_encoder(k, temporal_pos_k)
+
+        # Apply joint distance encoding
+        if joint_distance is not None:
+            joint_distance_emb = self.joint_pos_encoder(
+                joint_distance.flatten()
+            ).reshape(B, N, M, C)
+            # (B, h, N, M, c)
+            joint_distance_emb = joint_distance_emb.unflatten(
+                -1, (self.num_heads, -1)
+            ).permute(0, 3, 1, 2, 4)
+            # (B, h, N, 1, M, c)
+            joint_distance_emb = joint_distance_emb.unsqueeze(3)
+            # (B, h, N, T_q, 1, c)
+            q = q.unsqueeze(4)
+            # (B, h, N, T_q, M, c)
+            q = q * joint_distance_emb
+            # Compute attention: (B, h, N, T_q, M, c) x (B, h, M, T_k, c) -> (B, h, N*T_q, M*T_k)
+            attn = torch.einsum("bhnqmc,bhmkc->bhnqmk", q, k) * self.scale
+        else:
+            # Fallback: standard attention without joint distance
+            q_flat = q.reshape(B, self.num_heads, N * T_q, -1)
+            k_flat = k.reshape(B, self.num_heads, M * T_k, -1)
+            attn = (q_flat @ k_flat.transpose(-2, -1)) * self.scale
+            attn = attn.reshape(B, self.num_heads, N, T_q, M, T_k)
+
+        # Apply temporal causal mask
+        if temporal_attn_mask is not None:
+            attn = torch.where(
+                temporal_attn_mask[..., None, None, :, None, :],
+                float("-inf"),
+                attn,
+            )
+
+        # Flatten joint-temporal dims for softmax
+        attn = attn.reshape(B, self.num_heads, T_q * N, T_k * M)
+        attn = attn.softmax(dim=-1)
+
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2)  # (B, N*T_q, h, c)
+        x = x.reshape(B, N, T_q, C)
+
+        x = self.proj(x)
+        return x + identity
+
+
+# ---------------------------------------------------------------------------
 # AdaRMSNorm — adaptive RMSNorm conditioned on diffusion timestep
 # ---------------------------------------------------------------------------
 

@@ -1,9 +1,25 @@
 """Utility functions for HoloBrain policy.
 
-Ported from RoboOrchardLab with FK-related functions removed for Phase 1.
+Ported from RoboOrchardLab. Phase 4 adds URDF joint distance computation.
 """
 
 import torch
+
+
+def compute_joint_relative_pos(num_joints: int) -> torch.Tensor:
+    """Compute pairwise joint distances for a serial manipulator (linear chain).
+
+    For a linear chain like Franka Panda, the distance between joint i and j
+    is simply |i - j|. This captures the kinematic structure without needing
+    to parse a URDF file.
+
+    Args:
+        num_joints: Number of joints in the kinematic chain.
+    Returns:
+        (num_joints, num_joints) float tensor of pairwise distances.
+    """
+    idx = torch.arange(num_joints, dtype=torch.float32)
+    return (idx[:, None] - idx[None, :]).abs()
 
 
 def apply_scale_shift(

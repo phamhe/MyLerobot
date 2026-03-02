@@ -53,6 +53,14 @@ class HoloBrainConfig(PreTrainedConfig):
     spatial_softmax_num_keypoints: int = 32
     pretrained_backbone_weights: str | None = None
 
+    # --- URDF / Joint Graph ---
+    use_urdf: bool = False        # Enable URDF-based joint graph attention
+    num_joints: int = 7           # Number of joints (Franka Panda = 7)
+    # When use_urdf=True:
+    #   - State encoder projects EEF state to virtual joint tokens
+    #   - Action decoder uses TemporalJointGraphAttention
+    #   - joint_relative_pos computed as |i-j| (linear chain)
+
     # --- Loss ---
     smooth_l1_beta: float = 0.04
     timestep_loss_weight: float = 0.0
@@ -60,6 +68,7 @@ class HoloBrainConfig(PreTrainedConfig):
     rot_weight: float = 1.0
     grip_weight: float = 1.0
     loss_type: str = "mse"  # "mse" or "smooth_l1"
+    fk_loss_weight: float = 0.0   # FK loss weight (0 = disabled)
 
     # --- Training ---
     lr: float = 1e-4

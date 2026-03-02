@@ -50,7 +50,8 @@ class HoloBrainActionLoss(nn.Module):
             Scalar loss
         """
         if self.loss_type == "mse":
-            return F.mse_loss(pred, target)
+            loss = F.mse_loss(pred, target)
+            return loss
 
         # SmoothL1 mode (original)
         pred_pos = pred[..., :3]

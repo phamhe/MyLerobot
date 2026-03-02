@@ -2,6 +2,8 @@
 
 Integrates RGB encoder, Robot State Encoder, Action Decoder, and diffusion
 schedulers into a unified policy interface compatible with LeRobot.
+
+Phase 4 adds URDF-based joint graph attention when use_urdf=True.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from lerobot.common.policies.holobrain.action_decoder import HoloBrainActionDeco
 from lerobot.common.policies.holobrain.configuration_holobrain import HoloBrainConfig
 from lerobot.common.policies.holobrain.loss import HoloBrainActionLoss
 from lerobot.common.policies.holobrain.robot_state_encoder import HoloBrainRobotStateEncoder
+from lerobot.common.policies.holobrain.utils import compute_joint_relative_pos
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 
@@ -27,11 +30,16 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 class HoloBrainPolicy(PreTrainedPolicy):
     """HoloBrain-0 VLA+Diffusion policy ported to LeRobot.
 
-    Phase 1 simplified version:
-      - ResNet18 vision encoder (shared across cameras)
+    Phase 1 (use_urdf=False):
+      - ResNet18 vision encoder
       - Robot state encoder (4-layer Transformer, no URDF)
-      - Action decoder (6-layer DiT + UpsampleHead)
-      - DDPM training / DPMSolver inference
+      - Action decoder (6-layer DiT + UpsampleHead, TemporalSelfAttention)
+
+    Phase 4 (use_urdf=True):
+      - Same vision encoder
+      - Robot state encoder with JointGraphAttention (virtual joints)
+      - Action decoder with TemporalJointGraphAttention (URDF distances)
+      - Each action dim treated as a virtual joint
     """
 
     config_class = HoloBrainConfig
@@ -71,6 +79,8 @@ class HoloBrainPolicy(PreTrainedPolicy):
             num_layers=config.num_encoder_layers,
             num_heads=config.num_heads,
             feedforward_channels=config.feedforward_channels,
+            use_urdf=config.use_urdf,
+            num_joints=config.num_joints,
         )
 
         # --- Action decoder ---
@@ -82,7 +92,16 @@ class HoloBrainPolicy(PreTrainedPolicy):
             num_layers=config.num_decoder_layers,
             num_heads=config.num_heads,
             feedforward_channels=config.feedforward_channels,
+            use_urdf=config.use_urdf,
+            num_joints=config.num_joints,
         )
+
+        # --- URDF joint distances ---
+        if config.use_urdf:
+            joint_rel_pos = compute_joint_relative_pos(config.num_joints)
+            self.register_buffer("joint_relative_pos", joint_rel_pos)
+        else:
+            self.joint_relative_pos = None
 
         # --- Diffusion schedulers ---
         self.noise_scheduler = DDPMScheduler(
@@ -136,24 +155,25 @@ class HoloBrainPolicy(PreTrainedPolicy):
             )
 
         # Extract tensors
-        images = batch["observation.images"]  # (B, [T], N_cam, C, H, W) or (B, N_cam, C, H, W)
-        state = batch["observation.state"]    # (B, [T], state_dim)
-        action = batch["action"]              # (B, horizon, action_dim)
+        images = batch["observation.images"]
+        state = batch["observation.state"]
+        action = batch["action"]
 
-        # Handle temporal dimension: take last frame for images, keep all for state
+        # Handle temporal dimension
         if images.dim() == 6:
-            images = images[:, -1]  # (B, N_cam, C, H, W) — latest obs
+            images = images[:, -1]
         if state.dim() == 3:
-            # (B, T, state_dim) — keep all frames for state encoder
             pass
         elif state.dim() == 2:
-            state = state.unsqueeze(1)  # (B, 1, state_dim)
+            state = state.unsqueeze(1)
 
         # Encode images
-        img_features = self.rgb_encoder(images)  # (B, N_tokens, embed_dims)
+        img_features = self.rgb_encoder(images)
 
         # Encode state
-        state_features = self.state_encoder(state)  # (B, N_state, embed_dims)
+        state_features = self.state_encoder(
+            state, joint_relative_pos=self.joint_relative_pos
+        )
 
         # Pad action to pred_steps if needed
         B = action.shape[0]
@@ -163,7 +183,7 @@ class HoloBrainPolicy(PreTrainedPolicy):
         elif action.shape[1] > self.config.pred_steps:
             action = action[:, :self.config.pred_steps]
 
-        # Diffusion training: add noise and predict
+        # Diffusion training
         noise = torch.randn_like(action)
         timesteps = torch.randint(
             0, self.config.num_train_timesteps, (B,),
@@ -175,6 +195,7 @@ class HoloBrainPolicy(PreTrainedPolicy):
             noisy_action, timesteps,
             img_features=img_features,
             state_features=state_features,
+            joint_relative_pos=self.joint_relative_pos,
         )
 
         loss = self.loss_fn(pred_action, action, timesteps)
@@ -186,16 +207,11 @@ class HoloBrainPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select action for environment interaction.
-
-        Uses action queue: generates full trajectory, caches n_action_steps
-        actions, pops one per call.
-        """
+        """Select action for environment interaction."""
         if self._has_normalizer:
             batch = self.normalize_inputs(batch)
 
         if len(self._action_queue) == 0:
-            # Stack images
             if self.config.image_features:
                 batch = dict(batch)
                 batch["observation.images"] = torch.stack(
@@ -211,18 +227,18 @@ class HoloBrainPolicy(PreTrainedPolicy):
                 state = state.unsqueeze(1)
 
             img_features = self.rgb_encoder(images)
-            state_features = self.state_encoder(state)
+            state_features = self.state_encoder(
+                state, joint_relative_pos=self.joint_relative_pos
+            )
 
             B = images.shape[0]
             device = images.device
 
-            # Start from random noise
             action = torch.randn(
                 B, self.config.pred_steps, self.config.action_dim,
                 device=device,
             )
 
-            # DPMSolver iterative denoising
             self.inference_scheduler.set_timesteps(
                 self.config.num_inference_timesteps, device=device
             )
@@ -231,18 +247,17 @@ class HoloBrainPolicy(PreTrainedPolicy):
                     action, t.expand(B),
                     img_features=img_features,
                     state_features=state_features,
+                    joint_relative_pos=self.joint_relative_pos,
                 )
                 action = self.inference_scheduler.step(
                     pred, t, action
                 ).prev_sample
 
-            # Take first n_action_steps
-            actions = action[:, :self.config.n_action_steps]  # (B, n_act, action_dim)
+            actions = action[:, :self.config.n_action_steps]
 
             if self._has_normalizer:
                 actions = self.unnormalize_outputs({"action": actions})["action"]
 
-            # Queue up actions (each is (B, action_dim))
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
@@ -253,16 +268,12 @@ class HoloBrainPolicy(PreTrainedPolicy):
 # ---------------------------------------------------------------------------
 
 class _HoloBrainRgbEncoder(nn.Module):
-    """ResNet18-based image encoder with crop augmentation and spatial softmax.
-
-    Processes multiple camera views and returns flattened feature tokens.
-    """
+    """ResNet18-based image encoder with crop augmentation and spatial softmax."""
 
     def __init__(self, config: HoloBrainConfig):
         super().__init__()
         self.config = config
 
-        # Build backbone
         weights = config.pretrained_backbone_weights
         if weights:
             backbone = getattr(torchvision.models, config.vision_backbone)(
@@ -273,14 +284,11 @@ class _HoloBrainRgbEncoder(nn.Module):
                 weights=None
             )
 
-        # Optionally replace BatchNorm with GroupNorm
         if config.use_group_norm and not weights:
             backbone = _replace_bn_with_gn(backbone)
 
-        # Remove final FC and avgpool
         self.backbone = nn.Sequential(*list(backbone.children())[:-2])
 
-        # Determine feature dim by forward pass
         with torch.no_grad():
             dummy = torch.zeros(1, 3, *config.crop_shape)
             feat = self.backbone(dummy)
@@ -288,60 +296,42 @@ class _HoloBrainRgbEncoder(nn.Module):
             self._feat_h = feat.shape[2]
             self._feat_w = feat.shape[3]
 
-        # Spatial softmax
         self.num_kp = config.spatial_softmax_num_keypoints
         self.ss_proj = nn.Conv2d(self._feat_channels, self.num_kp, 1)
-
-        # Feature dim per camera: num_kp * 2 (x, y coordinates)
         self.feature_dim = self.num_kp * 2
-
-        # Project to embed_dims
         self.out_proj = nn.Linear(self.feature_dim, config.embed_dims)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images: (B, N_cam, C, H, W) — multiple camera views
-        Returns:
-            (B, N_cam, embed_dims) — one token per camera
-        """
         B, N_cam = images.shape[:2]
 
-        # Random crop during training
         if self.training and self.config.crop_is_random:
             images = self._random_crop(images)
         else:
             images = self._center_crop(images)
 
-        # Process all cameras together
-        x = images.flatten(0, 1)  # (B*N_cam, C, H, W)
-        x = self.backbone(x)     # (B*N_cam, feat_c, feat_h, feat_w)
-
-        # Spatial softmax
-        x = self._spatial_softmax(x)  # (B*N_cam, num_kp*2)
-        x = x.unflatten(0, (B, N_cam))  # (B, N_cam, num_kp*2)
-        x = self.out_proj(x)  # (B, N_cam, embed_dims)
+        x = images.flatten(0, 1)
+        x = self.backbone(x)
+        x = self._spatial_softmax(x)
+        x = x.unflatten(0, (B, N_cam))
+        x = self.out_proj(x)
 
         return x
 
     def _spatial_softmax(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply spatial softmax to extract keypoint coordinates."""
         B, C, H, W = x.shape
-        heatmap = self.ss_proj(x)  # (B, num_kp, H, W)
+        heatmap = self.ss_proj(x)
         heatmap = heatmap.reshape(B, self.num_kp, -1)
         heatmap = F.softmax(heatmap, dim=-1)
         heatmap = heatmap.reshape(B, self.num_kp, H, W)
 
-        # Compute expected coordinates
         pos_y = torch.linspace(-1, 1, H, device=x.device)
         pos_x = torch.linspace(-1, 1, W, device=x.device)
         expected_y = (heatmap.sum(-1) * pos_y[None, None]).sum(-1)
         expected_x = (heatmap.sum(-2) * pos_x[None, None]).sum(-1)
 
-        return torch.cat([expected_x, expected_y], dim=-1)  # (B, num_kp*2)
+        return torch.cat([expected_x, expected_y], dim=-1)
 
     def _random_crop(self, images: torch.Tensor) -> torch.Tensor:
-        """Apply random crop to images."""
         B, N, C, H, W = images.shape
         ch, cw = self.config.crop_shape
         if H <= ch and W <= cw:
@@ -357,7 +347,6 @@ class _HoloBrainRgbEncoder(nn.Module):
         return images.unflatten(0, (B, N))
 
     def _center_crop(self, images: torch.Tensor) -> torch.Tensor:
-        """Apply center crop to images."""
         B, N, C, H, W = images.shape
         ch, cw = self.config.crop_shape
         if H <= ch and W <= cw:

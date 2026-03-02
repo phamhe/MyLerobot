@@ -61,6 +61,10 @@ def parse_args():
     parser.add_argument("--single_camera", action="store_true")
     parser.add_argument("--train_task_id", type=int, default=None,
                         help="Dataset task_index used for training (for single-task normalization stats)")
+    parser.add_argument("--use_urdf", action="store_true",
+                        help="Enable URDF-based joint graph attention (Phase 4)")
+    parser.add_argument("--num_joints", type=int, default=7,
+                        help="Number of joints for URDF mode")
     return parser.parse_args()
 
 
@@ -249,13 +253,18 @@ def build_policy(args, device):
         chunk_size=args.chunk_size,
         n_action_steps=args.n_action_steps,
         device=device,
+        use_urdf=args.use_urdf,
+        num_joints=args.num_joints,
     )
     config.validate_features()
 
     policy = HoloBrainPolicy(config=config, dataset_stats=dataset_stats)
 
-    # Load checkpoint
-    state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    # Load checkpoint (support both file and directory formats)
+    ckpt_path = args.checkpoint
+    if os.path.isdir(ckpt_path):
+        ckpt_path = os.path.join(ckpt_path, "policy.pt")
+    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
     policy.load_state_dict(state_dict)
     policy.to(device)
     policy.eval()

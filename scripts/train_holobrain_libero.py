@@ -37,15 +37,22 @@ def parse_args():
     )
     parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="If set, train for N epochs (overrides --steps)")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_freq", type=int, default=10000)
+    parser.add_argument("--save_freq_epochs", type=int, default=None,
+                        help="Save checkpoint every N epochs (overrides --save_freq)")
     parser.add_argument("--log_freq", type=int, default=200)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--single_camera", action="store_true")
     parser.add_argument("--pretrained_backbone", action="store_true")
+    # Single-task training
+    parser.add_argument("--task_id", type=int, default=None,
+                        help="Train on single task by dataset task_index")
     # HoloBrain-specific
     parser.add_argument("--pred_steps", type=int, default=64)
     parser.add_argument("--chunk_size", type=int, default=4)
@@ -53,6 +60,10 @@ def parse_args():
     parser.add_argument("--embed_dims", type=int, default=256)
     parser.add_argument("--num_decoder_layers", type=int, default=6)
     parser.add_argument("--num_encoder_layers", type=int, default=4)
+    parser.add_argument("--loss_type", type=str, default="mse",
+                        help="Loss type: mse or smooth_l1")
+    parser.add_argument("--state_noise_std", type=float, default=0.0,
+                        help="Gaussian noise std for state augmentation")
     # Logging
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="holobrain-libero")
@@ -64,6 +75,127 @@ def parse_args():
         default="oc_7a337b608f93a7fab2448667151ee208",
     )
     return parser.parse_args()
+
+
+def find_task_episodes(dataset, task_id):
+    """Find episode indices for a specific task_index in the dataset.
+
+    Uses metadata files (tasks.jsonl + episodes.jsonl) for fast lookup
+    instead of iterating over all frames in hf_dataset.
+    """
+    import json
+
+    # Step 1: Get task name from tasks.jsonl
+    root = dataset.root if hasattr(dataset, 'root') else None
+    task_name = None
+
+    if root:
+        tasks_file = Path(root) / "meta" / "tasks.jsonl"
+        if tasks_file.exists():
+            with open(tasks_file) as f:
+                for line in f:
+                    obj = json.loads(line)
+                    if obj.get("task_index") == task_id:
+                        task_name = obj["task"]
+                        break
+
+    if task_name is None:
+        # Fallback: scan hf_dataset (slow)
+        logging.warning(f"tasks.jsonl not found, scanning hf_dataset for task_id={task_id}...")
+        hf_dataset = dataset.hf_dataset
+        episode_indices = set()
+        for row in hf_dataset:
+            if row.get("task_index") == task_id:
+                episode_indices.add(row["episode_index"])
+        return sorted(episode_indices)
+
+    logging.info(f"Task {task_id}: '{task_name}'")
+
+    # Step 2: Find episodes with matching task name from episodes.jsonl
+    episode_indices = []
+    if root:
+        episodes_file = Path(root) / "meta" / "episodes.jsonl"
+        if episodes_file.exists():
+            with open(episodes_file) as f:
+                for line in f:
+                    obj = json.loads(line)
+                    tasks = obj.get("tasks", [])
+                    if task_name in tasks:
+                        episode_indices.append(obj["episode_index"])
+
+    if not episode_indices:
+        # Fallback: scan hf_dataset
+        logging.warning("episodes.jsonl match failed, scanning hf_dataset...")
+        hf_dataset = dataset.hf_dataset
+        ep_set = set()
+        for row in hf_dataset:
+            if row.get("task_index") == task_id:
+                ep_set.add(row["episode_index"])
+        episode_indices = sorted(ep_set)
+
+    return sorted(episode_indices)
+
+
+def compute_single_task_stats(dataset, episodes):
+    """Compute normalization stats for a subset of episodes using parquet.
+
+    Reads state/action columns directly from parquet files for speed.
+    Images use global stats (MEAN_STD normalization is task-independent).
+    """
+    import torch
+    root = dataset.root if hasattr(dataset, 'root') else None
+    if root is None:
+        logging.warning("No dataset root, using global stats")
+        return None
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        logging.warning("pyarrow not available, using global stats")
+        return None
+
+    root = Path(root)
+    episode_set = set(episodes)
+    state_data = []
+    action_data = []
+
+    # Read parquet files directly (much faster than hf_dataset iteration)
+    data_dir = root / "data"
+    for chunk_dir in sorted(data_dir.iterdir()):
+        if not chunk_dir.is_dir():
+            continue
+        for pq_file in sorted(chunk_dir.glob("*.parquet")):
+            table = pq.read_table(pq_file, columns=["episode_index", "state", "actions"])
+            ep_col = table.column("episode_index").to_pylist()
+            for i, ep_idx in enumerate(ep_col):
+                if ep_idx in episode_set:
+                    state_data.append(torch.tensor(table.column("state")[i].as_py(), dtype=torch.float32))
+                    action_data.append(torch.tensor(table.column("actions")[i].as_py(), dtype=torch.float32))
+
+    if not state_data:
+        logging.warning("No data found for specified episodes")
+        return None
+
+    state_t = torch.stack(state_data)
+    action_t = torch.stack(action_data)
+
+    stats = {}
+    for key, tensor in [("state", state_t), ("actions", action_t)]:
+        flat = tensor.reshape(-1, tensor.shape[-1])
+        stats[key] = {
+            "mean": flat.mean(dim=0),
+            "std": flat.std(dim=0).clamp(min=1e-8),
+            "min": flat.min(dim=0).values,
+            "max": flat.max(dim=0).values,
+        }
+
+    # Copy global image stats from dataset
+    global_stats = dataset.meta.stats if hasattr(dataset, "meta") else {}
+    for k, v in global_stats.items():
+        if k not in stats:
+            stats[k] = v
+
+    return stats
 
 
 def send_feishu_notification(app_id, app_secret, chat_id, message):
@@ -174,6 +306,15 @@ def main():
         }
         logging.info(f"Will remap batch keys: {batch_key_remap}")
 
+    # Single-task episode filtering
+    task_episodes = None
+    if args.task_id is not None:
+        task_episodes = find_task_episodes(_tmp_ds, args.task_id)
+        logging.info(f"Single-task mode: task_id={args.task_id}, "
+                     f"found {len(task_episodes)} episodes")
+        if not task_episodes:
+            raise ValueError(f"No episodes found for task_id={args.task_id}")
+
     _fps = _tmp_ds.fps
     _dt = 1.0 / _fps
     logging.info(f"Dataset FPS: {_fps}")
@@ -220,6 +361,7 @@ def main():
         # Training
         lr=args.lr,
         device=device,
+        loss_type=args.loss_type,
     )
     config.validate_features()
 
@@ -250,16 +392,53 @@ def main():
             delta_timestamps[k] = action_ts
 
     logging.info(f"delta_timestamps keys: {list(delta_timestamps.keys())}")
+
+    # Compute single-task stats before deleting _tmp_ds
+    single_task_stats = None
+    if task_episodes is not None:
+        logging.info("Computing single-task normalization stats (parquet)...")
+        single_task_stats = compute_single_task_stats(_tmp_ds, task_episodes)
+        if single_task_stats:
+            logging.info(f"Single-task stats keys: {list(single_task_stats.keys())}")
+        else:
+            logging.info("Using global dataset stats (single-task stats unavailable)")
+
     del _tmp_ds
 
     ds_kwargs["delta_timestamps"] = delta_timestamps
+    if task_episodes is not None:
+        ds_kwargs["episodes"] = task_episodes
     dataset = LeRobotDataset(**ds_kwargs)
+
+    # Patch episode remap for single-task episode filtering
+    # (fixes IndexError when episodes= is used with LeRobotDataset)
+    if task_episodes is not None and hasattr(dataset, 'episode_data_index'):
+        # The filtered dataset has episode_data_index with 0-based indices,
+        # but hf_dataset rows retain original episode_index values (e.g., 388).
+        # Patch _get_query_indices to remap ep_idx before array lookup.
+        ep_remap = {ep: i for i, ep in enumerate(task_episodes)}
+        _orig_get_query_indices = dataset._get_query_indices
+
+        def _patched_get_query_indices(idx, ep_idx):
+            mapped = ep_remap.get(ep_idx, ep_idx)
+            return _orig_get_query_indices(idx, mapped)
+
+        dataset._get_query_indices = _patched_get_query_indices
+        logging.info(f"Patched _get_query_indices with episode remap: "
+                     f"{len(ep_remap)} episodes")
+
     logging.info(f"Dataset: {dataset.num_frames} frames, {dataset.num_episodes} episodes")
 
     # -----------------------------------------------------------------------
     # 4. Create policy
     # -----------------------------------------------------------------------
     dataset_stats = dataset.meta.stats if hasattr(dataset, "meta") else None
+
+    # Use single-task stats if available (overrides dataset-level mixed stats)
+    if single_task_stats is not None:
+        dataset_stats = single_task_stats
+        logging.info("Using single-task normalization stats")
+
     if dataset_stats and batch_key_remap:
         remapped_stats = {}
         for ds_key, std_key in batch_key_remap.items():
@@ -286,14 +465,6 @@ def main():
         lr=config.lr,
         weight_decay=config.weight_decay,
         betas=(0.95, 0.999),
-    )
-
-    from diffusers.optimization import get_scheduler
-    lr_scheduler = get_scheduler(
-        "cosine",
-        optimizer=optimizer,
-        num_warmup_steps=config.warmup_steps,
-        num_training_steps=args.steps,
     )
 
     # -----------------------------------------------------------------------
@@ -337,7 +508,26 @@ def main():
     # -----------------------------------------------------------------------
     # 9. Training loop
     # -----------------------------------------------------------------------
-    logging.info(f"Starting training: {args.steps} steps")
+    # Compute total steps
+    if args.epochs is not None:
+        steps_per_epoch = len(dataloader)
+        total_steps = args.epochs * steps_per_epoch
+        logging.info(f"Epoch mode: {args.epochs} epochs × {steps_per_epoch} steps/epoch "
+                     f"= {total_steps} total steps")
+    else:
+        total_steps = args.steps
+        steps_per_epoch = len(dataloader)
+
+    # Recompute lr scheduler with correct total steps
+    from diffusers.optimization import get_scheduler
+    lr_scheduler = get_scheduler(
+        "cosine",
+        optimizer=optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+    logging.info(f"Starting training: {total_steps} steps")
 
     def cycle(dl):
         while True:
@@ -352,7 +542,7 @@ def main():
     loss_sum = 0.0
     loss_count = 0
 
-    for step in range(1, args.steps + 1):
+    for step in range(1, total_steps + 1):
         batch = next(dl_iter)
 
         # Move to device
@@ -370,6 +560,11 @@ def main():
             batch["action_is_pad"] = torch.zeros(
                 batch["action"].shape[:-1], dtype=torch.bool, device=device,
             )
+
+        # State augmentation: add Gaussian noise for robustness
+        if args.state_noise_std > 0 and "observation.state" in batch:
+            state_noise = torch.randn_like(batch["observation.state"]) * args.state_noise_std
+            batch["observation.state"] = batch["observation.state"] + state_noise
 
         # Forward
         loss, _ = policy.forward(batch)
@@ -409,26 +604,39 @@ def main():
             loss_count = 0
 
         # Save checkpoint
-        if step % args.save_freq == 0 or step == args.steps:
+        save_by_step = (args.save_freq_epochs is None and
+                        step % args.save_freq == 0)
+        save_by_epoch = (args.save_freq_epochs is not None and
+                         steps_per_epoch > 0 and
+                         step % steps_per_epoch == 0 and
+                         (step // steps_per_epoch) % args.save_freq_epochs == 0)
+        save_final = (step == total_steps)
+
+        if save_by_step or save_by_epoch or save_final:
+            epoch_num = step // steps_per_epoch if steps_per_epoch > 0 else 0
             ckpt_dir = output_dir / f"checkpoint-{step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             torch.save(policy.state_dict(), ckpt_dir / "policy.pt")
             torch.save({
                 "step": step,
+                "epoch": epoch_num,
                 "optimizer": optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
             }, ckpt_dir / "training_state.pt")
-            logging.info(f"Checkpoint saved: {ckpt_dir}")
+            logging.info(f"Checkpoint saved: {ckpt_dir} (epoch {epoch_num})")
 
     # -----------------------------------------------------------------------
     # 10. Summary
     # -----------------------------------------------------------------------
     total_time = time.time() - start_time
+    task_info = f"task_id={args.task_id}" if args.task_id is not None else "all tasks"
+    epoch_info = f"{args.epochs} epochs" if args.epochs else f"{total_steps} steps"
     summary = (
         f"Training completed!\n"
-        f"  Steps: {args.steps}\n"
+        f"  Mode: {task_info}, {epoch_info}\n"
+        f"  Steps: {total_steps}\n"
         f"  Total time: {total_time:.0f}s ({total_time/3600:.1f}h)\n"
-        f"  Avg speed: {args.steps/total_time:.1f} steps/s\n"
+        f"  Avg speed: {total_steps/total_time:.1f} steps/s\n"
         f"  Output: {output_dir}\n"
         f"  Dataset: {args.dataset_repo_id}\n"
         f"  Batch size: {args.batch_size}\n"

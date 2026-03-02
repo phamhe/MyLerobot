@@ -59,6 +59,7 @@ class HoloBrainConfig(PreTrainedConfig):
     pos_weight: float = 1.0
     rot_weight: float = 1.0
     grip_weight: float = 1.0
+    loss_type: str = "mse"  # "mse" or "smooth_l1"
 
     # --- Training ---
     lr: float = 1e-4

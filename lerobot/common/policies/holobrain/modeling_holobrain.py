@@ -99,6 +99,7 @@ class HoloBrainPolicy(PreTrainedPolicy):
 
         # --- Loss ---
         self.loss_fn = HoloBrainActionLoss(
+            loss_type=config.loss_type,
             smooth_l1_beta=config.smooth_l1_beta,
             timestep_loss_weight=config.timestep_loss_weight,
             pos_weight=config.pos_weight,
